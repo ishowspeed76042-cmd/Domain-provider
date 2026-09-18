@@ -1,18 +1,28 @@
 const express = require('express');
 const bodyParser = require('body-parser');
 const TelegramBot = require('node-telegram-bot-api');
+const Razorpay = require('razorpay');
 
 // --- CONFIGURATION ---
 const TOKEN = process.env.TELEGRAM_BOT_TOKEN || '8712248611:AAHjNNE6Jspd05iSiy8ML5NivXd_-IleGxM';
 const PORT = process.env.PORT || 3000;
 const BASE_URL = process.env.RENDER_EXTERNAL_URL || `http://localhost:${PORT}`;
 
+// RAZORPAY CREDENTIALS
+const RAZORPAY_KEY_ID = process.env.RAZORPAY_KEY_ID || 'rzp_live_T3XuB57BqqsNzz';
+const RAZORPAY_KEY_SECRET = process.env.RAZORPAY_KEY_SECRET || 'rOuZhvU3USFwBB0PsHr8ZKzo';
+
+// Razorpay Instance
+const razorpay = new Razorpay({
+    key_id: RAZORPAY_KEY_ID,
+    key_secret: RAZORPAY_KEY_SECRET
+});
+
 const app = express();
 app.use(bodyParser.json());
 app.use(express.urlencoded({ extended: true }));
 
-// --- HEAVY IN-MEMORY DATABASE ---
-// स्ट्रक्चर: key (slug) -> value ({ targetUrl, owner, clicks, createdAt, slugId, password, seoTitle, seoDesc, mode })
+// --- IN-MEMORY DATABASE ---
 const siteDatabase = new Map();
 const userState = new Map();
 
@@ -24,7 +34,7 @@ const getMainMenu = () => {
     return {
         reply_markup: {
             inline_keyboard: [
-                [{ text: '🔗 Create Custom Link', callback_data: 'MENU_CREATE_PATH' }],
+                [{ text: '🔗 Create Custom Link (₹9)', callback_data: 'MENU_CREATE_PATH' }],
                 [{ text: '📋 Manage Links (Edit/Delete/Lock)', callback_data: 'MENU_MANAGE' }],
                 [{ text: '📊 Dashboard (Stats Only)', callback_data: 'MENU_DASHBOARD' }]
             ]
@@ -32,13 +42,71 @@ const getMainMenu = () => {
     };
 };
 
+// --- HELPER FUNCTION: RAZORPAY PAYMENT POLLING ---
+function startPaymentPolling(chatId, qrCodeId, linkDetails) {
+    const pollIntervalMs = 5000; // Har 5 sec me status check hoga
+    const timeoutMs = 15 * 60 * 1000; // 15 Min timeout
+    const startTime = Date.now();
+
+    const intervalId = setInterval(async () => {
+        // Stop polling if 15 mins passed
+        if (Date.now() - startTime > timeoutMs) {
+            clearInterval(intervalId);
+            userState.delete(chatId);
+            bot.sendMessage(chatId, "⏳ **Payment Timeout!** Payment not received within 15 minutes. Please try creating the link again.", getMainMenu());
+            return;
+        }
+
+        try {
+            // Fetch QR Status from Razorpay Official API
+            const qrDetails = await razorpay.qrCode.fetch(qrCodeId);
+
+            // Check if amount is paid (payments array or close_reason)
+            if (qrDetails.payments_amount_received >= 900 || qrDetails.status === 'closed') {
+                clearInterval(intervalId); // Stop polling
+
+                const slugId = linkDetails.slug;
+
+                // Save link to active Database after success
+                siteDatabase.set(slugId, {
+                    targetUrl: linkDetails.targetUrl,
+                    owner: chatId,
+                    type: 'path',
+                    clicks: 0,
+                    createdAt: new Date().toLocaleString(),
+                    slugId: slugId,
+                    password: null,
+                    seoTitle: `S-Projects: ${slugId}`,
+                    seoDesc: 'Click to open this secured and custom generated link.',
+                    mode: 'choice'
+                });
+
+                userState.delete(chatId);
+
+                const mainLink = `${BASE_URL}/${slugId}`;
+
+                bot.sendMessage(chatId, 
+                    `✅ **Payment Successful (₹9 Received)!**\n\n` +
+                    `🎉 **Link Successfully Created!**\n\n` +
+                    `🎯 **Target:** ${linkDetails.targetUrl}\n\n` +
+                    `🌐 **Main Link:**\n${mainLink}\n\n` +
+                    `*(By default, visitors will see a screen asking them to choose between Redirect or Iframe. You can change this in Manage Links!)*`,
+                    getMainMenu()
+                );
+            }
+        } catch (error) {
+            console.error("Polling Error:", error);
+        }
+    }, pollIntervalMs);
+}
+
 // --- TELEGRAM BOT LOGIC ---
 bot.on('message', async (msg) => {
     const chatId = msg.chat.id;
     const text = msg.text ? msg.text.trim() : '';
 
     if (text === '/start') {
-        userState.delete(chatId); // पुराना स्टेट क्लियर करें
+        userState.delete(chatId);
         return bot.sendMessage(chatId, 
             "🚀 **Welcome to S-Projects Premium Link Manager!**\n\n" +
             "Create advanced links (.bike, .water), set Passwords, SEO, and let users choose between Redirect & Iframe. Choose an option below:", 
@@ -49,7 +117,7 @@ bot.on('message', async (msg) => {
     const currentState = userState.get(chatId);
     if (!currentState) return;
 
-    // --- STATE: WAITING FOR PATH SLUG (NEW LINK) ---
+    // --- STATE: WAITING FOR PATH SLUG ---
     if (currentState.step === 'WAITING_FOR_SLUG') {
         let slugInput = text.toLowerCase().replace(/[^a-z0-9.-]/g, '');
 
@@ -64,7 +132,7 @@ bot.on('message', async (msg) => {
         return bot.sendMessage(chatId, `✅ Path reserved: \`${slugInput}\`\n\n🔗 Now, send me the **Target Website URL** (e.g., https://google.com) that should open when someone visits this link:`);
     }
 
-    // --- STATE: WAITING FOR TARGET URL (NEW LINK) ---
+    // --- STATE: WAITING FOR TARGET URL & GENERATE RAZORPAY QR CODE ---
     if (currentState.step === 'WAITING_FOR_TARGET_URL') {
         let targetUrl = text.trim();
         if (!targetUrl.startsWith('http://') && !targetUrl.startsWith('https://')) {
@@ -73,32 +141,50 @@ bot.on('message', async (msg) => {
 
         const slugId = currentState.slug;
 
-        // डेटाबेस में भारी डेटा सेव करना
-        siteDatabase.set(slugId, {
-            targetUrl: targetUrl,
-            owner: chatId,
-            type: 'path',
-            clicks: 0,
-            createdAt: new Date().toLocaleString(),
-            slugId: slugId,
-            password: null, // Default: No Password
-            seoTitle: `S-Projects: ${slugId}`,
-            seoDesc: 'Click to open this secured and custom generated link.',
-            mode: 'choice' // Default Mode: Shows options on screen to user
-        });
+        // User Status change to PAYMENT_PENDING
+        userState.set(chatId, { step: 'PAYMENT_PENDING', slug: slugId, targetUrl: targetUrl });
 
-        userState.delete(chatId);
+        bot.sendMessage(chatId, "⏳ **Generating Official ₹9 Razorpay Dynamic QR Code...** Please wait.");
 
-        const mainLink = `${BASE_URL}/${slugId}`;
-        
-        return bot.sendMessage(chatId, 
-            `🎉 **Link Successfully Created!**\n\n` +
-            `🎯 **Target:** ${targetUrl}\n\n` +
-            `🌐 **Main Link:**\n${mainLink}\n\n` +
-            `*(By default, visitors will see a screen asking them to choose between Redirect or Iframe. You can change this in Manage Links!)*\n\n` +
-            `Use the 'Manage Links' menu to set Passwords, Edit SEO, or change Mode!`,
-            getMainMenu()
-        );
+        try {
+            // Razorpay QR Code Creation Request
+            const qrResponse = await razorpay.qrCode.create({
+                type: 'upi_qr',
+                name: `Link Purchase: ${slugId}`,
+                usage: 'single_use',
+                fixed_amount: true,
+                payment_amount: 900, // ₹9.00 in paise
+                description: `Payment for custom link /${slugId}`,
+                close_by: Math.floor(Date.now() / 1000) + (15 * 60), // Valid for 15 minutes
+                notes: {
+                    chat_id: chatId.toString(),
+                    slug: slugId
+                }
+            });
+
+            const qrImageUrl = qrResponse.image_url;
+            const qrCodeId = qrResponse.id;
+
+            // Send QR Photo to user on Telegram
+            await bot.sendPhoto(chatId, qrImageUrl, {
+                caption: `💳 **Pay ₹9 to Activate Link**\n\n` +
+                         `🔗 **Path:** /${slugId}\n` +
+                         `🎯 **Target:** ${targetUrl}\n\n` +
+                         `📌 **Instructions:**\n` +
+                         `1. Scan the QR code above using Paytm, PhonePe, GPay, etc.\n` +
+                         `2. Complete ₹9 Payment.\n` +
+                         `3. Stay here, system will automatically detect payment within 15 minutes!`
+            });
+
+            // Start polling Razorpay for payment status
+            startPaymentPolling(chatId, qrCodeId, { slug: slugId, targetUrl: targetUrl });
+
+        } catch (err) {
+            console.error('Razorpay QR Creation Failed:', err);
+            userState.delete(chatId);
+            return bot.sendMessage(chatId, "❌ Failed to generate Razorpay Payment QR. Please check your Razorpay API keys or try again later.", getMainMenu());
+        }
+        return;
     }
 
     // --- STATE: EDITING EXISTING PATH SLUG ---
@@ -197,7 +283,6 @@ bot.on('callback_query', async (query) => {
             if (data.owner === chatId) {
                 hasLinks = true;
                 
-                // Mode text logic
                 let modeText = '⚙️ Mode: Choice Screen';
                 if(data.mode === 'redirect') modeText = '⚙️ Mode: Auto-Redirect';
                 if(data.mode === 'iframe') modeText = '⚙️ Mode: Auto-Iframe';
@@ -230,12 +315,10 @@ bot.on('callback_query', async (query) => {
         if (!hasLinks) bot.sendMessage(chatId, "❌ You don't have any active links.", getMainMenu());
     }
 
-    // --- DYNAMIC ACTIONS ---
     else if (action.startsWith('TGL_MODE_')) {
         const key = action.replace('TGL_MODE_', '');
         if (siteDatabase.has(key) && siteDatabase.get(key).owner === chatId) {
             const data = siteDatabase.get(key);
-            // Cycle Mode: choice -> redirect -> iframe -> choice
             if (data.mode === 'choice') data.mode = 'redirect';
             else if (data.mode === 'redirect') data.mode = 'iframe';
             else data.mode = 'choice';
@@ -275,7 +358,6 @@ bot.on('callback_query', async (query) => {
 
 // --- EXPRESS WEB ROUTES & MIDDLEWARES ---
 
-// 1. Home
 app.get('/', (req, res) => {
     res.send(`
         <!DOCTYPE html>
@@ -295,7 +377,7 @@ app.get('/', (req, res) => {
         <body>
             <div class="card">
                 <h1>S-Projects Engine 🚀</h1>
-                <p>Advanced Custom URLs, Password Protection, SEO Previews, Choice Screens, and Iframe Viewer are running perfectly.</p>
+                <p>Advanced Custom URLs, Password Protection, SEO Previews, Choice Screens, and Razorpay QR Payments are running perfectly.</p>
                 <div class="status-badge">● Systems Operational</div>
             </div>
         </body>
@@ -303,7 +385,6 @@ app.get('/', (req, res) => {
     `);
 });
 
-// 2. Auth Endpoint (For Checking Password on Any Route)
 app.post('/auth/:slug', (req, res) => {
     const slug = req.params.slug;
     const { password, targetType } = req.body; 
@@ -311,7 +392,6 @@ app.post('/auth/:slug', (req, res) => {
     if (siteDatabase.has(slug)) {
         const linkData = siteDatabase.get(slug);
         if (linkData.password === password) {
-            // Password Correct! Route based on Target Type
             if (targetType === 'view') {
                 linkData.clicks += 1;
                 return res.send(generateIframeHTML(linkData.targetUrl, slug, linkData.seoTitle));
@@ -321,7 +401,6 @@ app.post('/auth/:slug', (req, res) => {
                 return res.send(generateSEORedirectHTML(linkData));
             } 
             else if (targetType === 'main') {
-                // If it's the main link, check the Mode setting
                 if (linkData.mode === 'redirect') {
                     linkData.clicks += 1;
                     return res.send(generateSEORedirectHTML(linkData));
@@ -329,7 +408,7 @@ app.post('/auth/:slug', (req, res) => {
                     linkData.clicks += 1;
                     return res.send(generateIframeHTML(linkData.targetUrl, slug, linkData.seoTitle));
                 } else {
-                    return res.send(generateChoicePageHTML(linkData, slug)); // No click count here, user hasn't clicked yet
+                    return res.send(generateChoicePageHTML(linkData, slug));
                 }
             }
         } else {
@@ -340,17 +419,15 @@ app.post('/auth/:slug', (req, res) => {
     }
 });
 
-// 3. Main Portal Link Handler (BASE_URL/:slug) - THE NEW FEATURE!
 app.get('/:slug', (req, res) => {
     const slug = req.params.slug;
     if (siteDatabase.has(slug)) {
         const linkData = siteDatabase.get(slug);
         
         if (linkData.password) {
-            return res.send(generatePasswordPageHTML(slug, 'main')); // Ask password first
+            return res.send(generatePasswordPageHTML(slug, 'main'));
         }
         
-        // Behavior based on selected Mode
         if (linkData.mode === 'redirect') {
             linkData.clicks += 1;
             return res.send(generateSEORedirectHTML(linkData));
@@ -360,18 +437,15 @@ app.get('/:slug', (req, res) => {
             return res.send(generateIframeHTML(linkData.targetUrl, slug, linkData.seoTitle));
         } 
         else {
-            // mode === 'choice' -> Show the Choice Screen Landing Page
             return res.send(generateChoicePageHTML(linkData, slug));
         }
     } else {
-        // Fallback for root or invalid paths
         if(slug !== 'favicon.ico') {
             res.status(404).send('<h2 style="color:#ef4444; text-align:center; margin-top:50px; font-family:sans-serif;">404 - Link Not Found or Revoked! ❌</h2>');
         }
     }
 });
 
-// 4. Force Direct Redirect Handler (/r/:slug) - Still works as a bypass
 app.get('/r/:slug', (req, res) => {
     const slug = req.params.slug;
     if (siteDatabase.has(slug)) {
@@ -384,7 +458,6 @@ app.get('/r/:slug', (req, res) => {
     }
 });
 
-// 5. Force Iframe Viewer Handler (/view/:slug) - Still works as a bypass
 app.get('/view/:slug', (req, res) => {
     const slug = req.params.slug;
     if (siteDatabase.has(slug)) {
@@ -397,9 +470,8 @@ app.get('/view/:slug', (req, res) => {
     }
 });
 
-// --- HELPER HTML GENERATORS (HEAVY) ---
+// --- HELPER HTML GENERATORS ---
 
-// 🆕 NEW: User Choice Landing Page HTML 🆕
 function generateChoicePageHTML(linkData, slug) {
     return `
         <!DOCTYPE html>
@@ -440,7 +512,6 @@ function generateChoicePageHTML(linkData, slug) {
     `;
 }
 
-// Password Screen
 function generatePasswordPageHTML(slug, targetType, isError = false) {
     const errorMsg = isError ? `<div style="color: #ef4444; margin-bottom: 15px; font-weight: bold; background: #fee2e2; padding: 10px; border-radius: 6px;">❌ Incorrect Password. Try again.</div>` : '';
     return `
@@ -479,7 +550,6 @@ function generatePasswordPageHTML(slug, targetType, isError = false) {
     `;
 }
 
-// SEO Smart Redirect Screen (Shows Link Previews in WhatsApp, then redirects instantly)
 function generateSEORedirectHTML(linkData) {
     return `
         <!DOCTYPE html>
@@ -487,13 +557,11 @@ function generateSEORedirectHTML(linkData) {
         <head>
             <meta charset="UTF-8">
             <meta name="viewport" content="width=device-width, initial-scale=1.0">
-            <!-- OPEN GRAPH / SEO TAGS -->
             <title>${linkData.seoTitle}</title>
             <meta property="og:title" content="${linkData.seoTitle}" />
             <meta property="og:description" content="${linkData.seoDesc}" />
             <meta name="description" content="${linkData.seoDesc}" />
             <meta property="og:type" content="website" />
-            
             <style>
                 body { background: #0f172a; color: #94a3b8; font-family: sans-serif; text-align: center; padding-top: 20%; }
                 .loader { border: 4px solid #1e293b; border-top: 4px solid #38bdf8; border-radius: 50%; width: 40px; height: 40px; animation: spin 1s linear infinite; margin: 0 auto 20px; }
@@ -504,7 +572,6 @@ function generateSEORedirectHTML(linkData) {
             <div class="loader"></div>
             <h3>Redirecting...</h3>
             <script>
-                // Instant JS redirect for users, while crawlers stay and read SEO tags
                 setTimeout(() => { window.location.href = "${linkData.targetUrl}"; }, 500);
             </script>
         </body>
@@ -512,7 +579,6 @@ function generateSEORedirectHTML(linkData) {
     `;
 }
 
-// Iframe HTML (Heavy)
 function generateIframeHTML(targetUrl, titleText, seoTitle) {
     return `
         <!DOCTYPE html>
@@ -562,5 +628,5 @@ function generateIframeHTML(targetUrl, titleText, seoTitle) {
 
 // --- START SERVER ---
 app.listen(PORT, () => {
-    console.log(`🚀 Advanced Server with Choice Screen & Link Modes running on port ${PORT}`);
+    console.log(`🚀 Advanced Server with Razorpay ₹9 QR Payment & Polling running on port ${PORT}`);
 });
