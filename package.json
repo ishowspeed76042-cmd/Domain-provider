@@ -1,0 +1,17 @@
+{
+  "name": "s-projects-path-server",
+  "version": "1.0.0",
+  "description": "Telegram Bot Custom Path Link Generator and Viewer",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "body-parser": "^1.20.2",
+    "express": "^4.19.2",
+    "node-telegram-bot-api": "^0.65.1"
+  },
+  "engines": {
+    "node": ">=18.x"
+  }
+}
