@@ -12,7 +12,7 @@ app.use(bodyParser.json());
 app.use(express.urlencoded({ extended: true }));
 
 // --- HEAVY IN-MEMORY DATABASE ---
-// स्ट्रक्चर: key (slug) -> value ({ targetUrl, owner, type, clicks, createdAt, slugId, password, seoTitle, seoDesc })
+// स्ट्रक्चर: key (slug) -> value ({ targetUrl, owner, clicks, createdAt, slugId, password, seoTitle, seoDesc, mode })
 const siteDatabase = new Map();
 const userState = new Map();
 
@@ -41,7 +41,7 @@ bot.on('message', async (msg) => {
         userState.delete(chatId); // पुराना स्टेट क्लियर करें
         return bot.sendMessage(chatId, 
             "🚀 **Welcome to S-Projects Premium Link Manager!**\n\n" +
-            "Create custom path links (like .bike, .water), edit links, set passwords, and track analytics. Choose an option below:", 
+            "Create advanced links (.bike, .water), set Passwords, SEO, and let users choose between Redirect & Iframe. Choose an option below:", 
             getMainMenu()
         );
     }
@@ -73,7 +73,7 @@ bot.on('message', async (msg) => {
 
         const slugId = currentState.slug;
 
-        // डेटाबेस में सेव करना (नए फीचर्स के साथ)
+        // डेटाबेस में भारी डेटा सेव करना
         siteDatabase.set(slugId, {
             targetUrl: targetUrl,
             owner: chatId,
@@ -83,20 +83,20 @@ bot.on('message', async (msg) => {
             slugId: slugId,
             password: null, // Default: No Password
             seoTitle: `S-Projects: ${slugId}`,
-            seoDesc: 'Click to open this secured and custom generated link.'
+            seoDesc: 'Click to open this secured and custom generated link.',
+            mode: 'choice' // Default Mode: Shows options on screen to user
         });
 
         userState.delete(chatId);
 
-        const redirectLink = `${BASE_URL}/r/${slugId}`;
-        const iframeLink = `${BASE_URL}/view/${slugId}`;
+        const mainLink = `${BASE_URL}/${slugId}`;
         
         return bot.sendMessage(chatId, 
             `🎉 **Link Successfully Created!**\n\n` +
             `🎯 **Target:** ${targetUrl}\n\n` +
-            `👉 **Direct Redirect Link:**\n${redirectLink}\n\n` +
-            `🖥️ **Iframe Viewer Link:**\n${iframeLink}\n\n` +
-            `Use the 'Manage Links' menu to set Passwords, Edit SEO, or track your link!`,
+            `🌐 **Main Link:**\n${mainLink}\n\n` +
+            `*(By default, visitors will see a screen asking them to choose between Redirect or Iframe. You can change this in Manage Links!)*\n\n` +
+            `Use the 'Manage Links' menu to set Passwords, Edit SEO, or change Mode!`,
             getMainMenu()
         );
     }
@@ -120,8 +120,7 @@ bot.on('message', async (msg) => {
         siteDatabase.delete(oldSlug);
         
         userState.delete(chatId);
-
-        return bot.sendMessage(chatId, `✅ **Alias/Path Updated!**\n\n🔗 **New Path:** /${newSlugInput}\n👉 **Redirect:** ${BASE_URL}/r/${newSlugInput}`, getMainMenu());
+        return bot.sendMessage(chatId, `✅ **Alias/Path Updated!**\n\n🔗 **New Path:** /${newSlugInput}\n👉 **Main Link:** ${BASE_URL}/${newSlugInput}`, getMainMenu());
     }
 
     // --- STATE: EDITING TARGET URL ---
@@ -160,14 +159,13 @@ bot.on('message', async (msg) => {
         const editSlug = currentState.slug;
         const existingData = siteDatabase.get(editSlug);
         
-        // Expecting format: Title | Description
         const parts = text.split('|');
         existingData.seoTitle = parts[0] ? parts[0].trim() : `S-Projects: ${editSlug}`;
         existingData.seoDesc = parts[1] ? parts[1].trim() : 'Click to open this secured link.';
         
         siteDatabase.set(editSlug, existingData);
         userState.delete(chatId);
-        return bot.sendMessage(chatId, `🌐 **SEO Previews Updated!**\n\n**Title:** ${existingData.seoTitle}\n**Description:** ${existingData.seoDesc}\n\n*These will appear when you share the link on WhatsApp/Telegram!*`, getMainMenu());
+        return bot.sendMessage(chatId, `🌐 **SEO Previews Updated!**\n\n**Title:** ${existingData.seoTitle}\n**Description:** ${existingData.seoDesc}`, getMainMenu());
     }
 });
 
@@ -187,7 +185,7 @@ bot.on('callback_query', async (query) => {
             if (data.owner === chatId) {
                 hasLinks = true;
                 const lockStatus = data.password ? "🔒 Yes" : "🔓 No";
-                statsMsg += `🔗 **Path:** /${key}\n🎯 **Target:** ${data.targetUrl}\n👀 **Clicks:** ${data.clicks}\n🔑 **Locked:** ${lockStatus}\n📅 **Created:** ${data.createdAt}\n\n`;
+                statsMsg += `🔗 **Path:** /${key}\n🎯 **Target:** ${data.targetUrl}\n👀 **Clicks:** ${data.clicks}\n🔑 **Locked:** ${lockStatus}\n⚙️ **Mode:** ${data.mode}\n📅 **Created:** ${data.createdAt}\n\n`;
             }
         }
         if (!hasLinks) statsMsg = "❌ You don't have any active links yet.";
@@ -198,6 +196,12 @@ bot.on('callback_query', async (query) => {
         for (const [key, data] of siteDatabase.entries()) {
             if (data.owner === chatId) {
                 hasLinks = true;
+                
+                // Mode text logic
+                let modeText = '⚙️ Mode: Choice Screen';
+                if(data.mode === 'redirect') modeText = '⚙️ Mode: Auto-Redirect';
+                if(data.mode === 'iframe') modeText = '⚙️ Mode: Auto-Iframe';
+
                 const manageKeyboard = {
                     inline_keyboard: [
                         [
@@ -206,7 +210,10 @@ bot.on('callback_query', async (query) => {
                         ],
                         [
                             { text: data.password ? '🔓 Change/Remove Password' : '🔒 Set Password', callback_data: `SET_PASS_${key}` },
-                            { text: '🌐 Edit SEO/Preview', callback_data: `SET_SEO_${key}` }
+                            { text: '🌐 Edit SEO', callback_data: `SET_SEO_${key}` }
+                        ],
+                        [
+                            { text: modeText, callback_data: `TGL_MODE_${key}` }
                         ],
                         [
                             { text: '🗑️ Delete Link', callback_data: `DEL_${key}` }
@@ -215,7 +222,7 @@ bot.on('callback_query', async (query) => {
                 };
 
                 bot.sendMessage(chatId, 
-                    `📋 **Link:** /${key}\n🎯 **Target:** ${data.targetUrl}\n🔒 **Password:** ${data.password ? data.password : 'None'}`, 
+                    `📋 **Link:** /${key}\n🎯 **Target:** ${data.targetUrl}\n🔒 **Password:** ${data.password ? data.password : 'None'}\n⚙️ **Current Mode:** ${data.mode}`, 
                     { reply_markup: manageKeyboard }
                 );
             }
@@ -223,7 +230,20 @@ bot.on('callback_query', async (query) => {
         if (!hasLinks) bot.sendMessage(chatId, "❌ You don't have any active links.", getMainMenu());
     }
 
-    // Dynamic Edit Actions
+    // --- DYNAMIC ACTIONS ---
+    else if (action.startsWith('TGL_MODE_')) {
+        const key = action.replace('TGL_MODE_', '');
+        if (siteDatabase.has(key) && siteDatabase.get(key).owner === chatId) {
+            const data = siteDatabase.get(key);
+            // Cycle Mode: choice -> redirect -> iframe -> choice
+            if (data.mode === 'choice') data.mode = 'redirect';
+            else if (data.mode === 'redirect') data.mode = 'iframe';
+            else data.mode = 'choice';
+            
+            siteDatabase.set(key, data);
+            bot.sendMessage(chatId, `✅ **Behavior Mode Updated for /${key}**\nNew Mode is now: **${data.mode.toUpperCase()}**`, getMainMenu());
+        }
+    }
     else if (action.startsWith('E_P_')) {
         const key = action.replace('E_P_', '');
         userState.set(chatId, { step: 'WAITING_FOR_NEW_SLUG', oldSlug: key });
@@ -237,18 +257,19 @@ bot.on('callback_query', async (query) => {
     else if (action.startsWith('SET_PASS_')) {
         const key = action.replace('SET_PASS_', '');
         userState.set(chatId, { step: 'WAITING_FOR_PASSWORD', slug: key });
-        bot.sendMessage(chatId, `🔒 Enter the password you want to set for \`/${key}\`.\n\n*(Type 'remove' to disable password protection)*`);
+        bot.sendMessage(chatId, `🔒 Enter the password you want to set for \`/${key}\`.\n*(Type 'remove' to disable)*`);
     }
     else if (action.startsWith('SET_SEO_')) {
         const key = action.replace('SET_SEO_', '');
         userState.set(chatId, { step: 'WAITING_FOR_SEO', slug: key });
-        bot.sendMessage(chatId, `🌐 Send Title and Description separated by a pipe character (|).\n\nExample: \`My Awesome Bike Site | Click here to check out my latest bike designs!\``);
+        bot.sendMessage(chatId, `🌐 Send Title and Description separated by a pipe character (|).\nExample: \`Title | Description\``);
     }
     else if (action.startsWith('DEL_')) {
         const key = action.replace('DEL_', '');
         siteDatabase.delete(key);
         bot.sendMessage(chatId, `✅ Successfully deleted path: \`${key}\``, getMainMenu());
     }
+    
     bot.answerCallbackQuery(query.id);
 });
 
@@ -274,7 +295,7 @@ app.get('/', (req, res) => {
         <body>
             <div class="card">
                 <h1>S-Projects Engine 🚀</h1>
-                <p>Advanced Custom URLs, Password Protection, SEO Previews, and Iframe Viewer running perfectly.</p>
+                <p>Advanced Custom URLs, Password Protection, SEO Previews, Choice Screens, and Iframe Viewer are running perfectly.</p>
                 <div class="status-badge">● Systems Operational</div>
             </div>
         </body>
@@ -282,61 +303,142 @@ app.get('/', (req, res) => {
     `);
 });
 
-// 2. Auth Endpoint (For Checking Password)
+// 2. Auth Endpoint (For Checking Password on Any Route)
 app.post('/auth/:slug', (req, res) => {
     const slug = req.params.slug;
-    const { password, targetType } = req.body; // targetType = 'redirect' or 'view'
+    const { password, targetType } = req.body; 
     
     if (siteDatabase.has(slug)) {
         const linkData = siteDatabase.get(slug);
         if (linkData.password === password) {
-            linkData.clicks += 1;
+            // Password Correct! Route based on Target Type
             if (targetType === 'view') {
-                res.send(generateIframeHTML(linkData.targetUrl, slug, linkData.seoTitle));
-            } else {
-                res.send(generateSEORedirectHTML(linkData)); // Redirect via HTML for SEO
+                linkData.clicks += 1;
+                return res.send(generateIframeHTML(linkData.targetUrl, slug, linkData.seoTitle));
+            } 
+            else if (targetType === 'redirect') {
+                linkData.clicks += 1;
+                return res.send(generateSEORedirectHTML(linkData));
+            } 
+            else if (targetType === 'main') {
+                // If it's the main link, check the Mode setting
+                if (linkData.mode === 'redirect') {
+                    linkData.clicks += 1;
+                    return res.send(generateSEORedirectHTML(linkData));
+                } else if (linkData.mode === 'iframe') {
+                    linkData.clicks += 1;
+                    return res.send(generateIframeHTML(linkData.targetUrl, slug, linkData.seoTitle));
+                } else {
+                    return res.send(generateChoicePageHTML(linkData, slug)); // No click count here, user hasn't clicked yet
+                }
             }
         } else {
-            res.send(generatePasswordPageHTML(slug, targetType, true)); // True means error
+            res.send(generatePasswordPageHTML(slug, targetType, true)); 
         }
     } else {
         res.status(404).send('<h2 style="color:#ef4444; text-align:center; margin-top:50px;">404 - Link Revoked!</h2>');
     }
 });
 
-// 3. Direct Redirect Handler
+// 3. Main Portal Link Handler (BASE_URL/:slug) - THE NEW FEATURE!
+app.get('/:slug', (req, res) => {
+    const slug = req.params.slug;
+    if (siteDatabase.has(slug)) {
+        const linkData = siteDatabase.get(slug);
+        
+        if (linkData.password) {
+            return res.send(generatePasswordPageHTML(slug, 'main')); // Ask password first
+        }
+        
+        // Behavior based on selected Mode
+        if (linkData.mode === 'redirect') {
+            linkData.clicks += 1;
+            return res.send(generateSEORedirectHTML(linkData));
+        } 
+        else if (linkData.mode === 'iframe') {
+            linkData.clicks += 1;
+            return res.send(generateIframeHTML(linkData.targetUrl, slug, linkData.seoTitle));
+        } 
+        else {
+            // mode === 'choice' -> Show the Choice Screen Landing Page
+            return res.send(generateChoicePageHTML(linkData, slug));
+        }
+    } else {
+        // Fallback for root or invalid paths
+        if(slug !== 'favicon.ico') {
+            res.status(404).send('<h2 style="color:#ef4444; text-align:center; margin-top:50px; font-family:sans-serif;">404 - Link Not Found or Revoked! ❌</h2>');
+        }
+    }
+});
+
+// 4. Force Direct Redirect Handler (/r/:slug) - Still works as a bypass
 app.get('/r/:slug', (req, res) => {
     const slug = req.params.slug;
     if (siteDatabase.has(slug)) {
         const linkData = siteDatabase.get(slug);
-        if (linkData.password) {
-            res.send(generatePasswordPageHTML(slug, 'redirect'));
-        } else {
-            linkData.clicks += 1;
-            res.send(generateSEORedirectHTML(linkData));
-        }
+        if (linkData.password) return res.send(generatePasswordPageHTML(slug, 'redirect'));
+        linkData.clicks += 1;
+        res.send(generateSEORedirectHTML(linkData));
     } else {
         res.status(404).send('<h2 style="color:#ef4444; text-align:center; margin-top:50px;">404 - Link Revoked!</h2>');
     }
 });
 
-// 4. Iframe Viewer Handler
+// 5. Force Iframe Viewer Handler (/view/:slug) - Still works as a bypass
 app.get('/view/:slug', (req, res) => {
     const slug = req.params.slug;
     if (siteDatabase.has(slug)) {
         const linkData = siteDatabase.get(slug);
-        if (linkData.password) {
-            res.send(generatePasswordPageHTML(slug, 'view'));
-        } else {
-            linkData.clicks += 1;
-            res.send(generateIframeHTML(linkData.targetUrl, slug, linkData.seoTitle));
-        }
+        if (linkData.password) return res.send(generatePasswordPageHTML(slug, 'view'));
+        linkData.clicks += 1;
+        res.send(generateIframeHTML(linkData.targetUrl, slug, linkData.seoTitle));
     } else {
         res.status(404).send('<h2 style="color:#ef4444; text-align:center; margin-top:50px;">404 - Link Revoked!</h2>');
     }
 });
 
 // --- HELPER HTML GENERATORS (HEAVY) ---
+
+// 🆕 NEW: User Choice Landing Page HTML 🆕
+function generateChoicePageHTML(linkData, slug) {
+    return `
+        <!DOCTYPE html>
+        <html lang="en">
+        <head>
+            <meta charset="UTF-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
+            <title>${linkData.seoTitle} - Portal</title>
+            <meta property="og:title" content="${linkData.seoTitle}" />
+            <meta property="og:description" content="${linkData.seoDesc}" />
+            <style>
+                body { font-family: 'Segoe UI', Tahoma, sans-serif; background: #0f172a; color: #f8fafc; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; }
+                .box { background: #1e293b; padding: 40px; border-radius: 16px; box-shadow: 0 10px 30px rgba(0,0,0,0.8); text-align: center; max-width: 450px; width: 90%; border: 1px solid #334155; }
+                h2 { color: #38bdf8; margin-bottom: 10px; font-size: 24px; }
+                p { color: #94a3b8; margin-bottom: 30px; font-size: 15px; line-height: 1.5; }
+                .url-preview { background: #0f172a; padding: 12px; border-radius: 8px; font-family: monospace; color: #cbd5e1; margin-bottom: 30px; word-break: break-all; border: 1px solid #475569; }
+                .btn { display: block; width: 100%; padding: 16px; margin-bottom: 15px; border-radius: 10px; text-decoration: none; font-size: 16px; font-weight: bold; transition: 0.3s; color: white; text-align: center; box-sizing: border-box;}
+                .btn-redirect { background: #059669; border: 1px solid #047857; }
+                .btn-redirect:hover { background: #047857; transform: translateY(-2px); box-shadow: 0 5px 15px rgba(5, 150, 105, 0.4); }
+                .btn-iframe { background: #0ea5e9; border: 1px solid #0284c7; }
+                .btn-iframe:hover { background: #0284c7; transform: translateY(-2px); box-shadow: 0 5px 15px rgba(14, 165, 233, 0.4); }
+                .footer-text { margin-top: 20px; font-size: 12px; color: #64748b; }
+            </style>
+        </head>
+        <body>
+            <div class="box">
+                <h2>⚡ Choose Viewing Mode</h2>
+                <p>How would you like to open this secure link?</p>
+                <div class="url-preview">Path: /${slug}</div>
+                
+                <a href="/r/${slug}" class="btn btn-redirect">🌐 Open Directly (Redirect)</a>
+                <a href="/view/${slug}" class="btn btn-iframe">🖥️ View in Iframe Viewer</a>
+                
+                <div class="footer-text">Protected by S-Projects Network</div>
+            </div>
+        </body>
+        </html>
+    `;
+}
 
 // Password Screen
 function generatePasswordPageHTML(slug, targetType, isError = false) {
@@ -460,5 +562,5 @@ function generateIframeHTML(targetUrl, titleText, seoTitle) {
 
 // --- START SERVER ---
 app.listen(PORT, () => {
-    console.log(`🚀 Advanced Server with Link Lock & SEO running on port ${PORT}`);
+    console.log(`🚀 Advanced Server with Choice Screen & Link Modes running on port ${PORT}`);
 });
