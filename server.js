@@ -6,11 +6,15 @@ const Razorpay = require('razorpay');
 // --- CONFIGURATION ---
 const TOKEN = process.env.TELEGRAM_BOT_TOKEN || '8712248611:AAHjNNE6Jspd05iSiy8ML5NivXd_-IleGxM';
 const PORT = process.env.PORT || 3000;
-const BASE_URL = process.env.RENDER_EXTERNAL_URL || `http://localhost:${PORT}`;
+const BASE_URL = (process.env.RENDER_EXTERNAL_URL || `http://localhost:${PORT}`).replace(/\/+$/, '');
 
 // RAZORPAY CREDENTIALS
 const RAZORPAY_KEY_ID = process.env.RAZORPAY_KEY_ID || 'rzp_live_T3XuB57BqqsNzz';
 const RAZORPAY_KEY_SECRET = process.env.RAZORPAY_KEY_SECRET || 'rOuZhvU3USFwBB0PsHr8ZKzo';
+
+const LINK_PRICE_PAISE = 900; // ₹9.00
+const POLL_INTERVAL_MS = 5000; // 5 seconds
+const POLL_TIMEOUT_MS = 15 * 60 * 1000; // 15 minutes
 
 // Razorpay Instance
 const razorpay = new Razorpay({
@@ -22,16 +26,31 @@ const app = express();
 app.use(bodyParser.json());
 app.use(express.urlencoded({ extended: true }));
 
-// --- IN-MEMORY DATABASE ---
+// --- IN-MEMORY DATABASE & STATE ---
 const siteDatabase = new Map();
 const userState = new Map();
+const activePolls = new Map(); // chatId -> { intervalId, qrCodeId }
 
 // Telegram Bot Setup
 const bot = new TelegramBot(TOKEN, { polling: true });
 
+bot.on('polling_error', (err) => {
+    console.error('Telegram Polling Error:', err.code || err.message);
+});
+
+// --- HELPER: STOP ACTIVE POLLING FOR A USER ---
+function stopPaymentPolling(chatId) {
+    const existing = activePolls.get(chatId);
+    if (existing) {
+        clearInterval(existing.intervalId);
+        activePolls.delete(chatId);
+    }
+}
+
 // --- BOT MENUS & KEYBOARDS ---
 const getMainMenu = () => {
     return {
+        parse_mode: 'Markdown',
         reply_markup: {
             inline_keyboard: [
                 [{ text: '🔗 Create Custom Link (₹9)', callback_data: 'MENU_CREATE_PATH' }],
@@ -44,316 +63,451 @@ const getMainMenu = () => {
 
 // --- HELPER FUNCTION: RAZORPAY PAYMENT POLLING ---
 function startPaymentPolling(chatId, qrCodeId, linkDetails) {
-    const pollIntervalMs = 5000; // Har 5 sec me status check hoga
-    const timeoutMs = 15 * 60 * 1000; // 15 Min timeout
+    // Purana poll chal raha ho to pehle clean karo
+    stopPaymentPolling(chatId);
+
     const startTime = Date.now();
+    let isChecking = false;
 
     const intervalId = setInterval(async () => {
-        // Stop polling if 15 mins passed
-        if (Date.now() - startTime > timeoutMs) {
-            clearInterval(intervalId);
-            userState.delete(chatId);
-            bot.sendMessage(chatId, "⏳ **Payment Timeout!** Payment not received within 15 minutes. Please try creating the link again.", getMainMenu());
+        if (isChecking) return; // Pichli request khatam na hui ho to overlap roko
+
+        if (Date.now() - startTime >= POLL_TIMEOUT_MS) {
+            stopPaymentPolling(chatId);
+            const current = userState.get(chatId);
+            if (current && current.step === 'PAYMENT_PENDING' && current.qrCodeId === qrCodeId) {
+                userState.delete(chatId);
+            }
+            try {
+                await bot.sendMessage(
+                    chatId,
+                    "⏳ *Payment Timeout!* Payment not received within 15 minutes. Please try creating the link again.",
+                    getMainMenu()
+                );
+            } catch (sendErr) {
+                console.error('Timeout message send error:', sendErr.message);
+            }
             return;
         }
 
+        isChecking = true;
         try {
-            // Fetch QR Status from Razorpay Official API
             const qrDetails = await razorpay.qrCode.fetch(qrCodeId);
 
-            // Check if amount is paid (payments array or close_reason)
-            if (qrDetails.payments_amount_received >= 900 || qrDetails.status === 'closed') {
-                clearInterval(intervalId); // Stop polling
+            const amountReceived = Number(
+                qrDetails.payments_amount_received ??
+                qrDetails.payments_received ??
+                0
+            );
+            const isPaid =
+                amountReceived >= LINK_PRICE_PAISE ||
+                Number(qrDetails.payments_count_received || 0) > 0 ||
+                qrDetails.status === 'paid' ||
+                qrDetails.status === 'closed';
+
+            if (isPaid) {
+                stopPaymentPolling(chatId);
 
                 const slugId = linkDetails.slug;
-
-                // Save link to active Database after success
-                siteDatabase.set(slugId, {
-                    targetUrl: linkDetails.targetUrl,
-                    owner: chatId,
-                    type: 'path',
-                    clicks: 0,
-                    createdAt: new Date().toLocaleString(),
-                    slugId: slugId,
-                    password: null,
-                    seoTitle: `S-Projects: ${slugId}`,
-                    seoDesc: 'Click to open this secured and custom generated link.',
-                    mode: 'choice'
-                });
+                if (!siteDatabase.has(slugId)) {
+                    siteDatabase.set(slugId, {
+                        targetUrl: linkDetails.targetUrl,
+                        owner: chatId,
+                        type: 'path',
+                        clicks: 0,
+                        createdAt: new Date().toLocaleString(),
+                        slugId: slugId,
+                        password: null,
+                        seoTitle: `S-Projects: ${slugId}`,
+                        seoDesc: 'Click to open this secured and custom generated link.',
+                        mode: 'choice'
+                    });
+                }
 
                 userState.delete(chatId);
-
                 const mainLink = `${BASE_URL}/${slugId}`;
 
-                bot.sendMessage(chatId, 
-                    `✅ **Payment Successful (₹9 Received)!**\n\n` +
-                    `🎉 **Link Successfully Created!**\n\n` +
-                    `🎯 **Target:** ${linkDetails.targetUrl}\n\n` +
-                    `🌐 **Main Link:**\n${mainLink}\n\n` +
-                    `*(By default, visitors will see a screen asking them to choose between Redirect or Iframe. You can change this in Manage Links!)*`,
+                await bot.sendMessage(
+                    chatId,
+                    `✅ *Payment Successful (₹9 Received)!*\n\n` +
+                    `🎉 *Link Successfully Created!*\n\n` +
+                    `🎯 *Target:* ${linkDetails.targetUrl}\n\n` +
+                    `🌐 *Main Link:*\n${mainLink}\n\n` +
+                    `_(By default, visitors will see a screen asking them to choose between Redirect or Iframe. You can change this in Manage Links!)_`,
                     getMainMenu()
                 );
             }
         } catch (error) {
-            console.error("Polling Error:", error);
+            const statusCode = error?.statusCode || error?.error?.statusCode;
+            const errDesc = error?.error?.description || error?.message || 'Unknown polling error';
+            console.error(`Polling Error [QR: ${qrCodeId}] (${statusCode || 'NET'}):`, errDesc);
+        } finally {
+            isChecking = false;
         }
-    }, pollIntervalMs);
+    }, POLL_INTERVAL_MS);
+
+    activePolls.set(chatId, { intervalId, qrCodeId });
 }
 
 // --- TELEGRAM BOT LOGIC ---
 bot.on('message', async (msg) => {
-    const chatId = msg.chat.id;
-    const text = msg.text ? msg.text.trim() : '';
+    try {
+        if (!msg || !msg.chat) return;
+        const chatId = msg.chat.id;
+        const text = msg.text ? msg.text.trim() : '';
 
-    if (text === '/start') {
-        userState.delete(chatId);
-        return bot.sendMessage(chatId, 
-            "🚀 **Welcome to S-Projects Premium Link Manager!**\n\n" +
-            "Create advanced links (.bike, .water), set Passwords, SEO, and let users choose between Redirect & Iframe. Choose an option below:", 
-            getMainMenu()
-        );
-    }
-
-    const currentState = userState.get(chatId);
-    if (!currentState) return;
-
-    // --- STATE: WAITING FOR PATH SLUG ---
-    if (currentState.step === 'WAITING_FOR_SLUG') {
-        let slugInput = text.toLowerCase().replace(/[^a-z0-9.-]/g, '');
-
-        if (!slugInput || slugInput.includes('..')) {
-            return bot.sendMessage(chatId, "❌ Invalid name! Only letters, numbers, hyphens, and dots (.) are allowed. Try again:");
-        }
-        if (siteDatabase.has(slugInput)) {
-            return bot.sendMessage(chatId, `❌ The path \`${slugInput}\` is already taken. Choose another one:`);
-        }
-
-        userState.set(chatId, { step: 'WAITING_FOR_TARGET_URL', type: 'path', slug: slugInput });
-        return bot.sendMessage(chatId, `✅ Path reserved: \`${slugInput}\`\n\n🔗 Now, send me the **Target Website URL** (e.g., https://google.com) that should open when someone visits this link:`);
-    }
-
-    // --- STATE: WAITING FOR TARGET URL & GENERATE RAZORPAY QR CODE ---
-    if (currentState.step === 'WAITING_FOR_TARGET_URL') {
-        let targetUrl = text.trim();
-        if (!targetUrl.startsWith('http://') && !targetUrl.startsWith('https://')) {
-            targetUrl = 'https://' + targetUrl;
-        }
-
-        const slugId = currentState.slug;
-
-        // User Status change to PAYMENT_PENDING
-        userState.set(chatId, { step: 'PAYMENT_PENDING', slug: slugId, targetUrl: targetUrl });
-
-        bot.sendMessage(chatId, "⏳ **Generating Official ₹9 Razorpay Dynamic QR Code...** Please wait.");
-
-        try {
-            // Razorpay QR Code Creation Request
-            const qrResponse = await razorpay.qrCode.create({
-                type: 'upi_qr',
-                name: `Link Purchase: ${slugId}`,
-                usage: 'single_use',
-                fixed_amount: true,
-                payment_amount: 900, // ₹9.00 in paise
-                description: `Payment for custom link /${slugId}`,
-                close_by: Math.floor(Date.now() / 1000) + (15 * 60), // Valid for 15 minutes
-                notes: {
-                    chat_id: chatId.toString(),
-                    slug: slugId
-                }
-            });
-
-            const qrImageUrl = qrResponse.image_url;
-            const qrCodeId = qrResponse.id;
-
-            // Send QR Photo to user on Telegram
-            await bot.sendPhoto(chatId, qrImageUrl, {
-                caption: `💳 **Pay ₹9 to Activate Link**\n\n` +
-                         `🔗 **Path:** /${slugId}\n` +
-                         `🎯 **Target:** ${targetUrl}\n\n` +
-                         `📌 **Instructions:**\n` +
-                         `1. Scan the QR code above using Paytm, PhonePe, GPay, etc.\n` +
-                         `2. Complete ₹9 Payment.\n` +
-                         `3. Stay here, system will automatically detect payment within 15 minutes!`
-            });
-
-            // Start polling Razorpay for payment status
-            startPaymentPolling(chatId, qrCodeId, { slug: slugId, targetUrl: targetUrl });
-
-        } catch (err) {
-            console.error('Razorpay QR Creation Failed:', err);
+        if (text === '/start') {
+            stopPaymentPolling(chatId);
             userState.delete(chatId);
-            return bot.sendMessage(chatId, "❌ Failed to generate Razorpay Payment QR. Please check your Razorpay API keys or try again later.", getMainMenu());
-        }
-        return;
-    }
-
-    // --- STATE: EDITING EXISTING PATH SLUG ---
-    if (currentState.step === 'WAITING_FOR_NEW_SLUG') {
-        let newSlugInput = text.toLowerCase().replace(/[^a-z0-9.-]/g, '');
-        const oldSlug = currentState.oldSlug;
-
-        if (!newSlugInput || newSlugInput.includes('..')) {
-            return bot.sendMessage(chatId, "❌ Invalid name! Try again:");
-        }
-        if (siteDatabase.has(newSlugInput)) {
-            return bot.sendMessage(chatId, `❌ The path \`${newSlugInput}\` is already taken. Choose another one:`);
+            return await bot.sendMessage(
+                chatId,
+                "🚀 *Welcome to S-Projects Premium Link Manager!*\n\n" +
+                "Create advanced links (.bike, .water), set Passwords, SEO, and let users choose between Redirect & Iframe. Choose an option below:",
+                getMainMenu()
+            );
         }
 
-        const existingData = siteDatabase.get(oldSlug);
-        existingData.slugId = newSlugInput; 
-        
-        siteDatabase.set(newSlugInput, existingData);
-        siteDatabase.delete(oldSlug);
-        
-        userState.delete(chatId);
-        return bot.sendMessage(chatId, `✅ **Alias/Path Updated!**\n\n🔗 **New Path:** /${newSlugInput}\n👉 **Main Link:** ${BASE_URL}/${newSlugInput}`, getMainMenu());
-    }
+        const currentState = userState.get(chatId);
+        if (!currentState) return;
 
-    // --- STATE: EDITING TARGET URL ---
-    if (currentState.step === 'WAITING_FOR_NEW_TARGET') {
-        let newTargetUrl = text.trim();
-        if (!newTargetUrl.startsWith('http://') && !newTargetUrl.startsWith('https://')) newTargetUrl = 'https://' + newTargetUrl;
+        // --- STATE: WAITING FOR PATH SLUG ---
+        if (currentState.step === 'WAITING_FOR_SLUG') {
+            const slugInput = text.toLowerCase().replace(/[^a-z0-9.-]/g, '');
 
-        const editSlug = currentState.slug;
-        const existingData = siteDatabase.get(editSlug);
-        existingData.targetUrl = newTargetUrl;
-        siteDatabase.set(editSlug, existingData);
-        
-        userState.delete(chatId);
-        return bot.sendMessage(chatId, `✅ **Target URL Updated!**\n🔗 **Path:** /${editSlug}\n🎯 **New Target:** ${newTargetUrl}`, getMainMenu());
-    }
+            if (!slugInput || slugInput.includes('..') || slugInput.startsWith('.')) {
+                return await bot.sendMessage(
+                    chatId,
+                    "❌ Invalid name! Only letters, numbers, hyphens, and dots (.) are allowed. Try again:",
+                    { parse_mode: 'Markdown' }
+                );
+            }
+            if (siteDatabase.has(slugInput)) {
+                return await bot.sendMessage(
+                    chatId,
+                    `❌ The path \`${slugInput}\` is already taken. Choose another one:`,
+                    { parse_mode: 'Markdown' }
+                );
+            }
 
-    // --- STATE: SETTING PASSWORD ---
-    if (currentState.step === 'WAITING_FOR_PASSWORD') {
-        const editSlug = currentState.slug;
-        const existingData = siteDatabase.get(editSlug);
-        
-        if (text.toLowerCase() === 'remove') {
-            existingData.password = null;
-            bot.sendMessage(chatId, `🔓 **Password Removed!** Your link \`/${editSlug}\` is now public.`, getMainMenu());
-        } else {
-            existingData.password = text;
-            bot.sendMessage(chatId, `🔒 **Password Set!**\nAnyone opening \`/${editSlug}\` will now need to enter: \`${text}\``, getMainMenu());
+            userState.set(chatId, { step: 'WAITING_FOR_TARGET_URL', type: 'path', slug: slugInput });
+            return await bot.sendMessage(
+                chatId,
+                `✅ Path reserved: \`${slugInput}\`\n\n🔗 Now, send me the *Target Website URL* (e.g., https://google.com) that should open when someone visits this link:`,
+                { parse_mode: 'Markdown' }
+            );
         }
-        siteDatabase.set(editSlug, existingData);
-        userState.delete(chatId);
-        return;
-    }
 
-    // --- STATE: SETTING SEO DATA ---
-    if (currentState.step === 'WAITING_FOR_SEO') {
-        const editSlug = currentState.slug;
-        const existingData = siteDatabase.get(editSlug);
-        
-        const parts = text.split('|');
-        existingData.seoTitle = parts[0] ? parts[0].trim() : `S-Projects: ${editSlug}`;
-        existingData.seoDesc = parts[1] ? parts[1].trim() : 'Click to open this secured link.';
-        
-        siteDatabase.set(editSlug, existingData);
-        userState.delete(chatId);
-        return bot.sendMessage(chatId, `🌐 **SEO Previews Updated!**\n\n**Title:** ${existingData.seoTitle}\n**Description:** ${existingData.seoDesc}`, getMainMenu());
+        // --- STATE: WAITING FOR TARGET URL & GENERATE RAZORPAY QR CODE ---
+        if (currentState.step === 'WAITING_FOR_TARGET_URL') {
+            let targetUrl = text.trim();
+            if (!targetUrl) {
+                return await bot.sendMessage(chatId, "❌ Please send a valid URL.");
+            }
+            if (!targetUrl.startsWith('http://') && !targetUrl.startsWith('https://')) {
+                targetUrl = 'https://' + targetUrl;
+            }
+
+            const slugId = currentState.slug;
+
+            await bot.sendMessage(
+                chatId,
+                "⏳ *Generating Official ₹9 Razorpay Dynamic QR Code...* Please wait.",
+                { parse_mode: 'Markdown' }
+            );
+
+            try {
+                const closeByEpoch = Math.floor(Date.now() / 1000) + (15 * 60);
+                const qrResponse = await razorpay.qrCode.create({
+                    type: 'upi_qr',
+                    name: `Link Purchase ${slugId}`.slice(0, 50),
+                    usage: 'single_use',
+                    fixed_amount: true,
+                    payment_amount: LINK_PRICE_PAISE,
+                    description: `Payment for custom link /${slugId}`,
+                    close_by: closeByEpoch,
+                    notes: {
+                        chat_id: chatId.toString(),
+                        slug: slugId
+                    }
+                });
+
+                const qrImageUrl = qrResponse.image_url;
+                const qrCodeId = qrResponse.id;
+
+                userState.set(chatId, {
+                    step: 'PAYMENT_PENDING',
+                    slug: slugId,
+                    targetUrl: targetUrl,
+                    qrCodeId: qrCodeId
+                });
+
+                await bot.sendPhoto(chatId, qrImageUrl, {
+                    parse_mode: 'Markdown',
+                    caption:
+                        `💳 *Pay ₹9 to Activate Link*\n\n` +
+                        `🔗 *Path:* /${slugId}\n` +
+                        `🎯 *Target:* ${targetUrl}\n\n` +
+                        `📌 *Instructions:*\n` +
+                        `1. Scan the QR code above using Paytm, PhonePe, GPay, etc.\n` +
+                        `2. Complete ₹9 Payment.\n` +
+                        `3. Stay here, system will automatically detect payment within 15 minutes!`
+                });
+
+                startPaymentPolling(chatId, qrCodeId, { slug: slugId, targetUrl: targetUrl });
+            } catch (err) {
+                console.error('Razorpay QR Creation Failed:', err?.error || err?.message || err);
+                stopPaymentPolling(chatId);
+                userState.delete(chatId);
+                return await bot.sendMessage(
+                    chatId,
+                    "❌ Failed to generate Razorpay Payment QR. Please check your Razorpay API keys or try again later.",
+                    getMainMenu()
+                );
+            }
+            return;
+        }
+
+        // --- STATE: EDITING EXISTING PATH SLUG ---
+        if (currentState.step === 'WAITING_FOR_NEW_SLUG') {
+            const newSlugInput = text.toLowerCase().replace(/[^a-z0-9.-]/g, '');
+            const oldSlug = currentState.oldSlug;
+
+            if (!newSlugInput || newSlugInput.includes('..') || newSlugInput.startsWith('.')) {
+                return await bot.sendMessage(chatId, "❌ Invalid name! Try again:");
+            }
+            if (siteDatabase.has(newSlugInput)) {
+                return await bot.sendMessage(
+                    chatId,
+                    `❌ The path \`${newSlugInput}\` is already taken. Choose another one:`,
+                    { parse_mode: 'Markdown' }
+                );
+            }
+
+            const existingData = siteDatabase.get(oldSlug);
+            if (!existingData) {
+                userState.delete(chatId);
+                return await bot.sendMessage(chatId, "❌ Original link not found.", getMainMenu());
+            }
+
+            existingData.slugId = newSlugInput;
+            siteDatabase.set(newSlugInput, existingData);
+            siteDatabase.delete(oldSlug);
+
+            userState.delete(chatId);
+            return await bot.sendMessage(
+                chatId,
+                `✅ *Alias/Path Updated!*\n\n🔗 *New Path:* /${newSlugInput}\n👉 *Main Link:* ${BASE_URL}/${newSlugInput}`,
+                getMainMenu()
+            );
+        }
+
+        // --- STATE: EDITING TARGET URL ---
+        if (currentState.step === 'WAITING_FOR_NEW_TARGET') {
+            let newTargetUrl = text.trim();
+            if (!newTargetUrl.startsWith('http://') && !newTargetUrl.startsWith('https://')) {
+                newTargetUrl = 'https://' + newTargetUrl;
+            }
+
+            const editSlug = currentState.slug;
+            const existingData = siteDatabase.get(editSlug);
+            if (!existingData) {
+                userState.delete(chatId);
+                return await bot.sendMessage(chatId, "❌ Link not found.", getMainMenu());
+            }
+
+            existingData.targetUrl = newTargetUrl;
+            siteDatabase.set(editSlug, existingData);
+
+            userState.delete(chatId);
+            return await bot.sendMessage(
+                chatId,
+                `✅ *Target URL Updated!*\n🔗 *Path:* /${editSlug}\n🎯 *New Target:* ${newTargetUrl}`,
+                getMainMenu()
+            );
+        }
+
+        // --- STATE: SETTING PASSWORD ---
+        if (currentState.step === 'WAITING_FOR_PASSWORD') {
+            const editSlug = currentState.slug;
+            const existingData = siteDatabase.get(editSlug);
+            if (!existingData) {
+                userState.delete(chatId);
+                return await bot.sendMessage(chatId, "❌ Link not found.", getMainMenu());
+            }
+
+            if (text.toLowerCase() === 'remove') {
+                existingData.password = null;
+                siteDatabase.set(editSlug, existingData);
+                userState.delete(chatId);
+                return await bot.sendMessage(
+                    chatId,
+                    `🔓 *Password Removed!* Your link \`/${editSlug}\` is now public.`,
+                    getMainMenu()
+                );
+            } else {
+                existingData.password = text;
+                siteDatabase.set(editSlug, existingData);
+                userState.delete(chatId);
+                return await bot.sendMessage(
+                    chatId,
+                    `🔒 *Password Set!*\nAnyone opening \`/${editSlug}\` will now need to enter: \`${text}\``,
+                    getMainMenu()
+                );
+            }
+        }
+
+        // --- STATE: SETTING SEO DATA ---
+        if (currentState.step === 'WAITING_FOR_SEO') {
+            const editSlug = currentState.slug;
+            const existingData = siteDatabase.get(editSlug);
+            if (!existingData) {
+                userState.delete(chatId);
+                return await bot.sendMessage(chatId, "❌ Link not found.", getMainMenu());
+            }
+
+            const parts = text.split('|');
+            existingData.seoTitle = parts[0] && parts[0].trim() ? parts[0].trim() : `S-Projects: ${editSlug}`;
+            existingData.seoDesc = parts[1] && parts[1].trim() ? parts[1].trim() : 'Click to open this secured link.';
+
+            siteDatabase.set(editSlug, existingData);
+            userState.delete(chatId);
+            return await bot.sendMessage(
+                chatId,
+                `🌐 *SEO Previews Updated!*\n\n*Title:* ${existingData.seoTitle}\n*Description:* ${existingData.seoDesc}`,
+                getMainMenu()
+            );
+        }
+    } catch (err) {
+        console.error('Message Handler Error:', err);
     }
 });
 
 // --- BOT CALLBACK QUERIES ---
 bot.on('callback_query', async (query) => {
-    const chatId = query.message.chat.id;
-    const action = query.data;
+    try {
+        if (!query || !query.message) return;
+        const chatId = query.message.chat.id;
+        const action = query.data || '';
 
-    if (action === 'MENU_CREATE_PATH') {
-        userState.set(chatId, { step: 'WAITING_FOR_SLUG' });
-        bot.sendMessage(chatId, "🔗 Send me the custom path name (e.g., `portfolio.bike` or `my.app`):");
-    } 
-    else if (action === 'MENU_DASHBOARD') {
-        let statsMsg = "📊 **Your Analytics Dashboard:**\n\n";
-        let hasLinks = false;
-        for (const [key, data] of siteDatabase.entries()) {
-            if (data.owner === chatId) {
-                hasLinks = true;
-                const lockStatus = data.password ? "🔒 Yes" : "🔓 No";
-                statsMsg += `🔗 **Path:** /${key}\n🎯 **Target:** ${data.targetUrl}\n👀 **Clicks:** ${data.clicks}\n🔑 **Locked:** ${lockStatus}\n⚙️ **Mode:** ${data.mode}\n📅 **Created:** ${data.createdAt}\n\n`;
+        if (action === 'MENU_CREATE_PATH') {
+            stopPaymentPolling(chatId);
+            userState.set(chatId, { step: 'WAITING_FOR_SLUG' });
+            await bot.sendMessage(
+                chatId,
+                "🔗 Send me the custom path name (e.g., `portfolio.bike` or `my.app`):",
+                { parse_mode: 'Markdown' }
+            );
+        } else if (action === 'MENU_DASHBOARD') {
+            let statsMsg = "📊 *Your Analytics Dashboard:*\n\n";
+            let hasLinks = false;
+            for (const [key, data] of siteDatabase.entries()) {
+                if (data.owner === chatId) {
+                    hasLinks = true;
+                    const lockStatus = data.password ? "🔒 Yes" : "🔓 No";
+                    statsMsg +=
+                        `🔗 *Path:* /${key}\n` +
+                        `🎯 *Target:* ${data.targetUrl}\n` +
+                        `👀 *Clicks:* ${data.clicks}\n` +
+                        `🔑 *Locked:* ${lockStatus}\n` +
+                        `⚙️ *Mode:* ${data.mode}\n` +
+                        `📅 *Created:* ${data.createdAt}\n\n`;
+                }
             }
-        }
-        if (!hasLinks) statsMsg = "❌ You don't have any active links yet.";
-        bot.sendMessage(chatId, statsMsg, getMainMenu());
-    } 
-    else if (action === 'MENU_MANAGE') {
-        let hasLinks = false;
-        for (const [key, data] of siteDatabase.entries()) {
-            if (data.owner === chatId) {
-                hasLinks = true;
-                
-                let modeText = '⚙️ Mode: Choice Screen';
-                if(data.mode === 'redirect') modeText = '⚙️ Mode: Auto-Redirect';
-                if(data.mode === 'iframe') modeText = '⚙️ Mode: Auto-Iframe';
+            if (!hasLinks) statsMsg = "❌ You don't have any active links yet.";
+            await bot.sendMessage(chatId, statsMsg, getMainMenu());
+        } else if (action === 'MENU_MANAGE') {
+            let hasLinks = false;
+            for (const [key, data] of siteDatabase.entries()) {
+                if (data.owner === chatId) {
+                    hasLinks = true;
 
-                const manageKeyboard = {
-                    inline_keyboard: [
-                        [
-                            { text: '✏️ Edit Path', callback_data: `E_P_${key}` },
-                            { text: '✏️ Edit Target', callback_data: `E_T_${key}` }
-                        ],
-                        [
-                            { text: data.password ? '🔓 Change/Remove Password' : '🔒 Set Password', callback_data: `SET_PASS_${key}` },
-                            { text: '🌐 Edit SEO', callback_data: `SET_SEO_${key}` }
-                        ],
-                        [
-                            { text: modeText, callback_data: `TGL_MODE_${key}` }
-                        ],
-                        [
-                            { text: '🗑️ Delete Link', callback_data: `DEL_${key}` }
+                    let modeText = '⚙️ Mode: Choice Screen';
+                    if (data.mode === 'redirect') modeText = '⚙️ Mode: Auto-Redirect';
+                    if (data.mode === 'iframe') modeText = '⚙️ Mode: Auto-Iframe';
+
+                    const manageKeyboard = {
+                        inline_keyboard: [
+                            [
+                                { text: '✏️ Edit Path', callback_data: `E_P_${key}` },
+                                { text: '✏️ Edit Target', callback_data: `E_T_${key}` }
+                            ],
+                            [
+                                { text: data.password ? '🔓 Change/Remove Password' : '🔒 Set Password', callback_data: `SET_PASS_${key}` },
+                                { text: '🌐 Edit SEO', callback_data: `SET_SEO_${key}` }
+                            ],
+                            [
+                                { text: modeText, callback_data: `TGL_MODE_${key}` }
+                            ],
+                            [
+                                { text: '🗑️ Delete Link', callback_data: `DEL_${key}` }
+                            ]
                         ]
-                    ]
-                };
+                    };
 
-                bot.sendMessage(chatId, 
-                    `📋 **Link:** /${key}\n🎯 **Target:** ${data.targetUrl}\n🔒 **Password:** ${data.password ? data.password : 'None'}\n⚙️ **Current Mode:** ${data.mode}`, 
-                    { reply_markup: manageKeyboard }
+                    await bot.sendMessage(
+                        chatId,
+                        `📋 *Link:* /${key}\n🎯 *Target:* ${data.targetUrl}\n🔒 *Password:* ${data.password ? data.password : 'None'}\n⚙️ *Current Mode:* ${data.mode}`,
+                        { parse_mode: 'Markdown', reply_markup: manageKeyboard }
+                    );
+                }
+            }
+            if (!hasLinks) {
+                await bot.sendMessage(chatId, "❌ You don't have any active links.", getMainMenu());
+            }
+        } else if (action.startsWith('TGL_MODE_')) {
+            const key = action.replace('TGL_MODE_', '');
+            if (siteDatabase.has(key) && siteDatabase.get(key).owner === chatId) {
+                const data = siteDatabase.get(key);
+                if (data.mode === 'choice') data.mode = 'redirect';
+                else if (data.mode === 'redirect') data.mode = 'iframe';
+                else data.mode = 'choice';
+
+                siteDatabase.set(key, data);
+                await bot.sendMessage(
+                    chatId,
+                    `✅ *Behavior Mode Updated for /${key}*\nNew Mode is now: *${data.mode.toUpperCase()}*`,
+                    getMainMenu()
                 );
             }
+        } else if (action.startsWith('E_P_')) {
+            const key = action.replace('E_P_', '');
+            userState.set(chatId, { step: 'WAITING_FOR_NEW_SLUG', oldSlug: key });
+            await bot.sendMessage(chatId, `✏️ Send NEW Alias to replace \`/${key}\`:`, { parse_mode: 'Markdown' });
+        } else if (action.startsWith('E_T_')) {
+            const key = action.replace('E_T_', '');
+            userState.set(chatId, { step: 'WAITING_FOR_NEW_TARGET', slug: key });
+            await bot.sendMessage(chatId, `✏️ Send NEW Target URL for \`/${key}\`:`, { parse_mode: 'Markdown' });
+        } else if (action.startsWith('SET_PASS_')) {
+            const key = action.replace('SET_PASS_', '');
+            userState.set(chatId, { step: 'WAITING_FOR_PASSWORD', slug: key });
+            await bot.sendMessage(
+                chatId,
+                `🔒 Enter the password you want to set for \`/${key}\`.\n_(Type 'remove' to disable)_`,
+                { parse_mode: 'Markdown' }
+            );
+        } else if (action.startsWith('SET_SEO_')) {
+            const key = action.replace('SET_SEO_', '');
+            userState.set(chatId, { step: 'WAITING_FOR_SEO', slug: key });
+            await bot.sendMessage(
+                chatId,
+                `🌐 Send Title and Description separated by a pipe character (|).\nExample: \`Title | Description\``,
+                { parse_mode: 'Markdown' }
+            );
+        } else if (action.startsWith('DEL_')) {
+            const key = action.replace('DEL_', '');
+            if (siteDatabase.has(key) && siteDatabase.get(key).owner === chatId) {
+                siteDatabase.delete(key);
+                await bot.sendMessage(chatId, `✅ Successfully deleted path: \`${key}\``, getMainMenu());
+            }
         }
-        if (!hasLinks) bot.sendMessage(chatId, "❌ You don't have any active links.", getMainMenu());
-    }
 
-    else if (action.startsWith('TGL_MODE_')) {
-        const key = action.replace('TGL_MODE_', '');
-        if (siteDatabase.has(key) && siteDatabase.get(key).owner === chatId) {
-            const data = siteDatabase.get(key);
-            if (data.mode === 'choice') data.mode = 'redirect';
-            else if (data.mode === 'redirect') data.mode = 'iframe';
-            else data.mode = 'choice';
-            
-            siteDatabase.set(key, data);
-            bot.sendMessage(chatId, `✅ **Behavior Mode Updated for /${key}**\nNew Mode is now: **${data.mode.toUpperCase()}**`, getMainMenu());
-        }
+        await bot.answerCallbackQuery(query.id);
+    } catch (err) {
+        console.error('Callback Query Error:', err);
+        try {
+            await bot.answerCallbackQuery(query.id);
+        } catch (_) {}
     }
-    else if (action.startsWith('E_P_')) {
-        const key = action.replace('E_P_', '');
-        userState.set(chatId, { step: 'WAITING_FOR_NEW_SLUG', oldSlug: key });
-        bot.sendMessage(chatId, `✏️ Send NEW Alias to replace \`/${key}\`:`);
-    }
-    else if (action.startsWith('E_T_')) {
-        const key = action.replace('E_T_', '');
-        userState.set(chatId, { step: 'WAITING_FOR_NEW_TARGET', slug: key });
-        bot.sendMessage(chatId, `✏️ Send NEW Target URL for \`/${key}\`:`);
-    }
-    else if (action.startsWith('SET_PASS_')) {
-        const key = action.replace('SET_PASS_', '');
-        userState.set(chatId, { step: 'WAITING_FOR_PASSWORD', slug: key });
-        bot.sendMessage(chatId, `🔒 Enter the password you want to set for \`/${key}\`.\n*(Type 'remove' to disable)*`);
-    }
-    else if (action.startsWith('SET_SEO_')) {
-        const key = action.replace('SET_SEO_', '');
-        userState.set(chatId, { step: 'WAITING_FOR_SEO', slug: key });
-        bot.sendMessage(chatId, `🌐 Send Title and Description separated by a pipe character (|).\nExample: \`Title | Description\``);
-    }
-    else if (action.startsWith('DEL_')) {
-        const key = action.replace('DEL_', '');
-        siteDatabase.delete(key);
-        bot.sendMessage(chatId, `✅ Successfully deleted path: \`${key}\``, getMainMenu());
-    }
-    
-    bot.answerCallbackQuery(query.id);
 });
 
 // --- EXPRESS WEB ROUTES & MIDDLEWARES ---
@@ -387,20 +541,18 @@ app.get('/', (req, res) => {
 
 app.post('/auth/:slug', (req, res) => {
     const slug = req.params.slug;
-    const { password, targetType } = req.body; 
-    
+    const { password, targetType } = req.body;
+
     if (siteDatabase.has(slug)) {
         const linkData = siteDatabase.get(slug);
         if (linkData.password === password) {
             if (targetType === 'view') {
                 linkData.clicks += 1;
                 return res.send(generateIframeHTML(linkData.targetUrl, slug, linkData.seoTitle));
-            } 
-            else if (targetType === 'redirect') {
+            } else if (targetType === 'redirect') {
                 linkData.clicks += 1;
                 return res.send(generateSEORedirectHTML(linkData));
-            } 
-            else if (targetType === 'main') {
+            } else if (targetType === 'main') {
                 if (linkData.mode === 'redirect') {
                     linkData.clicks += 1;
                     return res.send(generateSEORedirectHTML(linkData));
@@ -412,7 +564,7 @@ app.post('/auth/:slug', (req, res) => {
                 }
             }
         } else {
-            res.send(generatePasswordPageHTML(slug, targetType, true)); 
+            res.send(generatePasswordPageHTML(slug, targetType, true));
         }
     } else {
         res.status(404).send('<h2 style="color:#ef4444; text-align:center; margin-top:50px;">404 - Link Revoked!</h2>');
@@ -423,24 +575,22 @@ app.get('/:slug', (req, res) => {
     const slug = req.params.slug;
     if (siteDatabase.has(slug)) {
         const linkData = siteDatabase.get(slug);
-        
+
         if (linkData.password) {
             return res.send(generatePasswordPageHTML(slug, 'main'));
         }
-        
+
         if (linkData.mode === 'redirect') {
             linkData.clicks += 1;
             return res.send(generateSEORedirectHTML(linkData));
-        } 
-        else if (linkData.mode === 'iframe') {
+        } else if (linkData.mode === 'iframe') {
             linkData.clicks += 1;
             return res.send(generateIframeHTML(linkData.targetUrl, slug, linkData.seoTitle));
-        } 
-        else {
+        } else {
             return res.send(generateChoicePageHTML(linkData, slug));
         }
     } else {
-        if(slug !== 'favicon.ico') {
+        if (slug !== 'favicon.ico') {
             res.status(404).send('<h2 style="color:#ef4444; text-align:center; margin-top:50px; font-family:sans-serif;">404 - Link Not Found or Revoked! ❌</h2>');
         }
     }
