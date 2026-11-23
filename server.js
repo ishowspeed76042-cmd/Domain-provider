@@ -376,7 +376,7 @@ app.get('/', (req, res) => {
         </head>
         <body>
             <div class="card">
-                <h1>S-Projects Engine 🚀</h1>
+                <h1>S-PROJECTS 🚀</h1>
                 <p>Advanced Custom URLs, Password Protection, SEO Previews, Choice Screens, and Razorpay QR Payments are running perfectly.</p>
                 <div class="status-badge">● Systems Operational</div>
             </div>
