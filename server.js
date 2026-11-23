@@ -4,7 +4,7 @@ const TelegramBot = require('node-telegram-bot-api');
 const Razorpay = require('razorpay');
 
 // --- CONFIGURATION ---
-const TOKEN = process.env.TELEGRAM_BOT_TOKEN || '8712248611:AAHjNNE6Jspd05iSiy8ML5NivXd_-IleGxM';
+const TOKEN = process.env.TELEGRAM_BOT_TOKEN || '9181955723:AAF2EOTSXv66pU2CCDbkxfQwDNfhlwJvick';
 const PORT = process.env.PORT || 3000;
 const BASE_URL = (process.env.RENDER_EXTERNAL_URL || `http://localhost:${PORT}`).replace(/\/+$/, '');
 
